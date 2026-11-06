@@ -5819,6 +5819,7 @@ extension URLSessionDataTask: PersistentTransfer {
 }
 
 private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private static let redirectBodyLimit: Int64 = 4 * 1024 * 1024
     private let sourceTrace: SourceNetworkDiagnostics.Trace
     weak var reader: AVIOReader?
     let generation: Int
@@ -5949,7 +5950,7 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         ticketLock.lock()
         redirectCount += 1
         let length = response.expectedContentLength
-        let valid = redirectCount <= 5 && length >= 0 && length <= 4 * 1024 * 1024
+        let valid = redirectCount <= 5 && length <= Self.redirectBodyLimit
             && DispatchTime.now() < requestDeadline
         pendingRedirect = valid ? next : nil
         expectedBytes = length
@@ -6023,7 +6024,9 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
             ticketLock.lock()
             receivedBytes += Int64(data.count)
             let redirectBody = pendingRedirect != nil
+            let redirectTooLarge = redirectBody && receivedBytes > Self.redirectBodyLimit
             ticketLock.unlock()
+            if redirectTooLarge { expire(task: dataTask) }
             if redirectBody { return }
         }
         reader?.appendPersistentData(data, generation: generation)
@@ -6036,7 +6039,12 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
     ) {
         sourceTrace.completed(task: task, error: error)
         ticketLock.lock()
-        let complete = error == nil && validRange && receivedBytes == expectedBytes
+        // A redirect without Content-Length can finish naturally at EOF or the end of a chunked
+        // body. Keep the ticket until that callback and bound the bytes even without a header.
+        let finishedUnknownRedirect = pendingRedirect != nil && expectedBytes < 0
+            && receivedBytes <= Self.redirectBodyLimit
+        let complete = error == nil && !expired && validRange
+            && (receivedBytes == expectedBytes || finishedUnknownRedirect)
         let next = complete && transitionDeadline == nil && DispatchTime.now() < requestDeadline
             ? pendingRedirect : nil
         pendingRedirect = nil
