@@ -14,6 +14,12 @@ import UIKit
 #endif
 import MediaPlayer
 
+/// Whether a stopped strict-origin session has drained its network activity.
+public enum SourceDrainOutcome: Sendable {
+    case safe
+    case uncertain
+}
+
 /// AetherEngine, format-agnostic video muxer that feeds AVPlayer.
 ///
 /// Open-source LGPL 3.0 engine that takes any source (HTTP, file://,
@@ -7329,6 +7335,28 @@ public final class AetherEngine: ObservableObject {
     /// cancels it. PiP hosts do not need this: an active PiP window already forces the handover.
     public func prepareForItemReplacement() {
         nextLoadRequestsInPlaceItemHandover = true
+    }
+
+    /// Stop and observe the budget for the explicitly named source, including a load still unwinding.
+    /// The host must serialize later loads with this call. An uncertain result must not be treated as
+    /// permission to open another transport for the same account.
+    public func stopAndDrain(sourceURL: URL, timeout: TimeInterval = 8) async -> SourceDrainOutcome {
+        let precedingLoads = waitingLoadGenerations
+        stop()
+        let stoppedGeneration = loadGeneration
+        guard timeout.isFinite, timeout > 0 else { return .uncertain }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
+        while true {
+            guard !Task.isCancelled, loadGeneration == stoppedGeneration else { return .uncertain }
+            switch OriginRequestBudget.shared.drainStatus(for: sourceURL) {
+            case .uncertain: return .uncertain
+            case .safe where waitingLoadGenerations.isDisjoint(with: precedingLoads): return .safe
+            case .safe, .pending: break
+            }
+            guard ContinuousClock.now < deadline else { return .uncertain }
+            do { try await Task.sleep(for: .milliseconds(20)) }
+            catch { return .uncertain }
+        }
     }
 
     public func stop(resetDisplayCriteria: Bool = true, finalTeardown: Bool? = nil) {

@@ -182,6 +182,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         var limit: Int?
         var hostLimit: Int?
         var admissionBlocked = false
+        var acquiring = 0
         var refusals = 0
         var lastRefusalAt: DispatchTime?
         /// nil `quietUntil` means the request-rate pacer is inert. The bucket remains untouched
@@ -268,6 +269,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         if let joining {
             merged.admissionBlocked = merged.admissionBlocked || joining.admissionBlocked
             merged.inflight += joining.inflight
+            merged.acquiring += joining.acquiring
             merged.peakInflight = max(max(merged.peakInflight, joining.peakInflight), merged.inflight)
             merged.refusals += joining.refusals
             merged.limit = Self.tighter(merged.limit, joining.limit)
@@ -454,6 +456,21 @@ final class OriginRequestBudget: @unchecked Sendable {
                  allowOvercommit: Bool = true,
                  shouldAbort: (() -> Bool)? = nil) -> Ticket? {
         guard let raw = Self.originKey(for: url) else { return nil }
+        lock.lock()
+        let acquiringKey = headLocked(raw)
+        var acquiringState = origins[acquiringKey] ?? OriginState()
+        acquiringState.acquiring += 1
+        origins[acquiringKey] = acquiringState
+        lock.unlock()
+        defer {
+            lock.lock()
+            let key = headLocked(raw)
+            if var state = origins[key] {
+                state.acquiring = max(0, state.acquiring - 1)
+                origins[key] = state
+            }
+            lock.unlock()
+        }
 
         let started = DispatchTime.now()
         // Rate before concurrency. The two rules bind different things and only this order lets a
@@ -805,6 +822,16 @@ final class OriginRequestBudget: @unchecked Sendable {
                 + " that target, not our concurrency."
         }
         return note
+    }
+
+    enum DrainStatus { case pending, safe, uncertain }
+
+    func drainStatus(for url: URL) -> DrainStatus {
+        guard let raw = Self.originKey(for: url) else { return .uncertain }
+        lock.lock(); defer { lock.unlock() }
+        guard let state = origins[headLocked(raw)] else { return .uncertain }
+        if state.admissionBlocked || state.hostLimit != 1 { return .uncertain }
+        return state.inflight == 0 && state.waiters.isEmpty && state.acquiring == 0 ? .safe : .pending
     }
 
     func hasStrictHostLimit(for url: URL) -> Bool {
