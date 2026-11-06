@@ -2202,8 +2202,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         openPhaseActive = false
         winCond.broadcast()
         winCond.unlock()
-        transfer?.cancelTransfer()
-        transfer?.releaseOriginTicket()   // #377: the fresh reader asks for this slot next
+        retirePersistentTransfer(transfer)
         tailTask?.cancel()
     }
 
@@ -2268,8 +2267,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         tailTask?.cancel()
         // #220: the shared session is never invalidated, so the transfer has to be cancelled
         // explicitly. Invalidating used to be what released this connection.
-        transfer?.cancelTransfer()
-        transfer?.releaseOriginTicket()
+        retirePersistentTransfer(transfer)
+    }
+
+    private func retirePersistentTransfer(_ transfer: (any PersistentTransfer)?) {
+        guard let transfer else { return }
+        if let task = transfer as? URLSessionDataTask,
+           let delegate = task.delegate as? PersistentReadDelegate, delegate.strict {
+            DispatchQueue.global().async { delegate.drain(task: task) }
+        } else {
+            transfer.cancelTransfer()
+            transfer.releaseOriginTicket()
+        }
     }
 
     // MARK: - Read (called by FFmpeg on demux thread)
@@ -3720,10 +3729,33 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     // MARK: - Persistent Connection (lifecycle + delegate callbacks)
 
+    fileprivate func continueStrictRedirect(from oldTask: URLSessionTask, to newTask: URLSessionDataTask,
+                                            generation: Int) -> Bool {
+        winCond.lock(); defer { winCond.unlock() }
+        guard generation == connGeneration, !isClosed,
+              let active = activeTransfer as? URLSessionDataTask, active === oldTask else { return false }
+        guard let delegate = newTask.delegate as? PersistentReadDelegate else { return false }
+        activeTransfer = newTask
+        guard delegate.resumeRedirect(task: newTask) else {
+            activeTransfer = oldTask as? URLSessionDataTask
+            return false
+        }
+        return true
+    }
+
     /// Open a fresh Range: bytes=<offset>- connection (live: always `bytes=0-`, see the
     /// request construction below). Bumps generation so late callbacks from the old
     /// connection are ignored.
     private func startPersistentConnection(at target: Int64, boundedTo: Int64? = nil, openEnded: Bool = false) {
+        let strict = OriginRequestBudget.shared.hasStrictHostLimit(for: url) && !isLive && !heldConnectionEnabled
+        if strict {
+            winCond.lock()
+            let previous = activeTransfer as? URLSessionDataTask
+            winCond.unlock()
+            if let previous, let delegate = previous.delegate as? PersistentReadDelegate {
+                delegate.drain(task: previous)
+            }
+        }
         winCond.lock()
         connGeneration &+= 1
         let generation = connGeneration
@@ -3753,7 +3785,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // consumer is ready, so the ASK is what bounds the window. A pull bounds it at the read
         // instead, and asking for a finite range would put the request cadence straight back. An
         // explicit caller bound still wins, because that caller wants a specific amount read.
-        let resolvedBound: Int64? = boundedTo ?? {
+        let resolvedBound: Int64? = (strict ? min(boundedTo ?? 4 * 1024 * 1024, 4 * 1024 * 1024) : boundedTo) ?? {
             guard !openEnded else { return nil }
             guard !heldConnectionEnabled else { return nil }
             guard !isLive else { return nil }
@@ -3819,7 +3851,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.broadcast()
         winCond.unlock()
 
-        oldTransfer?.cancelTransfer()
+        if !strict { oldTransfer?.cancelTransfer() }
         // #377: hand the old range's origin slot back HERE rather than waiting for its
         // `didCompleteWithError`, which arrives asynchronously. On a single-slot origin the pump
         // would otherwise queue behind its own previous range at every 32 MB boundary and spend
@@ -3847,7 +3879,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // at the frontier either way.
             request.setValue("bytes=\(askAsJoin ? 0 : offset)-", forHTTPHeaderField: "Range")
         }
-        request.timeoutInterval = 0  // long-lived; stalls handled by the reader
+        request.timeoutInterval = strict ? 35 : 0  // strict requests also have an absolute deadline below
         applyExtraHeaders(&request)
 
         // #377: take the origin slot before the connection goes on the link. The pump is the one
@@ -3859,7 +3891,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             for: requestURLForBudget, label: "\(label)#\(openDiagnosticID) pump", timeout: Self.pumpSlotWaitSeconds,
             shouldAbort: { [weak self] in self?.isClosed ?? true })
         // Audit DMX-112: a pump torn down while parked for its slot leaves without a transfer.
-        if ticket == nil, isClosed { return }
+        guard ticket != nil else {
+            persistentConnectionEnded(error: AVIOReaderError.requestTimeout, generation: generation)
+            return
+        }
 
         let transfer: any PersistentTransfer
         if heldConnectionEnabled {
@@ -3880,7 +3915,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 generation: generation,
                 extraHeaders: headers(for: request.url),
                 ticket: ticket,
-                originURL: requestURLForBudget
+                originURL: requestURLForBudget,
+                strict: strict
             )
             let task = (persistentRequestSession ?? Self.persistentSession).dataTask(with: request)
             task.delegate = delegate
@@ -3899,6 +3935,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         winCond.unlock()
 
         transfer.startTransfer()
+        if strict, let task = transfer as? URLSessionDataTask,
+           let delegate = task.delegate as? PersistentReadDelegate {
+            DispatchQueue.global().asyncAfter(deadline: .now() + 35) { [weak delegate] in
+                delegate?.expireCurrent()
+            }
+        }
         // #309: from here the generation is watched on wall-clock time, not on consumer cadence.
         armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
         armFirstByteWitness(generation: generation, originURL: requestURLForBudget)
@@ -4264,7 +4306,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // which never asks for more than the window has room for, so reaching this point at all
         // would be a bookkeeping surprise rather than an origin outrunning the consumer; ending it
         // would put back exactly the request-per-drain-cycle cadence the flag exists to remove.
-        if ahead > winHighWater, !connEnded, !isClosed,
+        if !OriginRequestBudget.shared.hasStrictHostLimit(for: url), ahead > winHighWater, !connEnded, !isClosed,
            let installed = activeTransfer, !installed.isDemandDriven {
             connEndedByBackpressure = true
             connEnded = true
@@ -4585,7 +4627,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return
         }
         let lease = OriginRequestBudget.Lease(streamTicket)
-        defer { lease.release() }
 
         let semaphore = DispatchSemaphore(value: 0)
 
@@ -5040,7 +5081,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return -1
         }
         let lease = OriginRequestBudget.Lease(ticket)
-        defer { lease.release() }
+        var taskStarted = false
+        defer { if !taskStarted { lease.release() } }
         guard !scope.isStopped, !isClosed, remaining() > 0 else { return -1 }
         request.timeoutInterval = max(0.001, remaining())
         let delegate = ProbeDelegate(extraHeaders: headers(for: request.url), diagnosticContext: diagnosticContext)
@@ -5057,6 +5099,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             self?.recordResolvedURL($0)
         }
         guard scope.resume(task) else { task.cancel(); return -1 }
+        taskStarted = true
         defer { scope.remove(task) }
         let outcome = Self.awaitSignal(completion, budget: remaining(), pollInterval: 0.05,
             shouldAbort: { [weak self] in scope.isStopped || self?.isClosed != false })
@@ -5105,7 +5148,6 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             return nil
         }
         let lease = OriginRequestBudget.Lease(ticket)
-        defer { lease.release() }
 
         let delegate = ProbeDelegate(extraHeaders: headers(for: request.url), diagnosticContext: diagnosticContext)
         let task = (probeRequestSession ?? Self.probeSession).dataTask(with: request)
@@ -5362,6 +5404,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 OriginRequestBudget.shared.release(ticket)
                 throw CancellationError()
             }
+            guard ticket != nil else { throw AVIOReaderError.requestTimeout }
             return ticket
         }
         guard !isClosed else { throw CancellationError() }
@@ -5372,7 +5415,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // origin, which is the ordinary shape when a host probes several items off one server.
         let slotWait = probeControl.remainingTime.map { min(timeout, $0) } ?? timeout
         guard let ticket = OriginRequestBudget.shared.acquire(
-            for: url, label: label, timeout: slotWait) else {
+            for: url, label: label, timeout: slotWait, allowOvercommit: !requireGranted) else {
             probeControl.stop(ProbeError.sourceBusy)
             throw ProbeError.sourceBusy
         }
@@ -5407,13 +5450,12 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                              slotWait: TimeInterval = AVIOReader.shortFetchSlotWaitSeconds) throws -> (Data, URLResponse) {
         // #377: every short fetch the reader makes (detour blocks, size probes, HEAD) funnels
         // through here, so this is the one place that has to take an origin slot for all of them.
-        // Refusals are charged before the completion callback returns the slot. Early exit
-        // releases the same lease idempotently.
+        // Refusals are charged before completion returns the slot. The completion callback
+        // retains the lease even if this caller times out and requests cancellation.
         let slotURL = request.url ?? url
         let ticket = try requestTicket(
             for: slotURL, label: "\(label) \(slotLabel)", timeout: slotWait)
         let lease = OriginRequestBudget.Lease(ticket)
-        defer { lease.release() }
 
         let delegate = ChunkFetchDelegate(extraHeaders: headers(for: request.url),
                                           bodyLimit: Self.expectedBodyBytes(for: request), diagnosticContext: diagnosticContext)
@@ -5750,9 +5792,8 @@ protocol PersistentTransfer: AnyObject {
     func startTransfer()
     /// End it. Idempotent, and never called while `winCond` is held.
     func cancelTransfer()
-    /// Hand the origin slot back synchronously. The transfer's own completion would do it too, but
-    /// that arrives asynchronously and every caller here is about to ask for a slot again.
-    /// Idempotent, so the later callback is a no-op.
+    /// Release an unused reservation. A started URLSession transfer retains its reservation
+    /// until didCompleteWithError confirms the request has ended, including cancellation.
     func releaseOriginTicket()
     /// True when bytes only move because the reader asked. The high-water end exists to stop a
     /// transport delivering on its own schedule; against a pull it would end a healthy connection
@@ -5761,11 +5802,14 @@ protocol PersistentTransfer: AnyObject {
 }
 
 extension URLSessionDataTask: PersistentTransfer {
-    func startTransfer() { resume() }
+    func startTransfer() {
+        (delegate as? PersistentReadDelegate)?.markStarted(task: self)
+        resume()
+    }
     func cancelTransfer() { cancel() }
     /// The ticket lives on the delegate because the delegate's lifetime IS the task's; see the
     /// note on `PersistentReadDelegate.ticket`.
-    func releaseOriginTicket() { (delegate as? PersistentReadDelegate)?.releaseTicket() }
+    func releaseOriginTicket() { (delegate as? PersistentReadDelegate)?.releaseTicketIfNeverStarted() }
     var isDemandDriven: Bool { false }
 }
 
@@ -5780,27 +5824,96 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
     /// `didCompleteWithError` is the one point every ending passes through, cancels included.
     private let ticketLock = NSLock()
     private var ticket: OriginRequestBudget.Ticket?
+    private var wasStarted = false
+    let strict: Bool
+    private let completion = DispatchGroup()
+    private var transportDone = false
+    private var requestDeadline = DispatchTime.distantFuture
+    private var transitionDeadline: DispatchTime?
+    private var expectedBytes: Int64 = -1
+    private var receivedBytes: Int64 = 0
+    private var validRange = false
+    private var pendingRedirect: URLRequest?
+    private var redirectCount = 0
+    private weak var currentTask: URLSessionDataTask?
+    private var expired = false
     /// The URL this connection was opened against, for the one-per-origin transport line.
     private let originURL: URL
 
     init(reader: AVIOReader, diagnosticContext: SourceNetworkDiagnostics.Context?, generation: Int, extraHeaders: [String: String],
-         ticket: OriginRequestBudget.Ticket?, originURL: URL) {
+         ticket: OriginRequestBudget.Ticket?, originURL: URL, strict: Bool) {
         self.sourceTrace = .init(role: .persistentRead, context: diagnosticContext)
         self.reader = reader
         self.generation = generation
         self.extraHeaders = extraHeaders
         self.ticket = ticket
         self.originURL = originURL
+        self.strict = strict
+        completion.enter()
+    }
+
+    func drain(task: URLSessionDataTask) {
+        ticketLock.lock()
+        if transitionDeadline == nil { transitionDeadline = .now() + 5 }
+        let deadline = min(transitionDeadline!, requestDeadline)
+        ticketLock.unlock()
+        if completion.wait(timeout: deadline) == .timedOut { expire(task: task) }
+    }
+
+    func expireCurrent() {
+        ticketLock.lock()
+        let task = currentTask
+        ticketLock.unlock()
+        if let task { expire(task: task) }
+    }
+
+    func expire(task: URLSessionDataTask) {
+        ticketLock.lock()
+        guard !transportDone else { ticketLock.unlock(); return }
+        expired = true
+        if strict { OriginRequestBudget.shared.blockAdmission(for: originURL) }
+        let activeTask = currentTask ?? task
+        ticketLock.unlock()
+        activeTask.cancel()
     }
 
     /// Backstop. A slot that is never returned would cap this origin one lower for the life of the
     /// process, and at a limit of 1 that means every later request waits out its full budget before
     /// proceeding. `didCompleteWithError` covers every ending a task actually reaches; this covers
     /// a delegate that is released without its task ever completing.
-    deinit { releaseTicket() }
+    deinit {
+        if strict && wasStarted && !transportDone { OriginRequestBudget.shared.blockAdmission(for: originURL) }
+        releaseTicket()
+    }
 
-    /// Give the slot back. Idempotent: a reconnect releases synchronously so the pump does not
-    /// queue behind its own previous range, and `didCompleteWithError` then finds nothing to do.
+    func markStarted(task: URLSessionDataTask) {
+        ticketLock.lock()
+        if !wasStarted { requestDeadline = .now() + 35 }
+        wasStarted = true
+        currentTask = task
+        ticketLock.unlock()
+    }
+
+    func resumeRedirect(task: URLSessionDataTask) -> Bool {
+        ticketLock.lock(); defer { ticketLock.unlock() }
+        guard !expired, transitionDeadline == nil, DispatchTime.now() < requestDeadline else { return false }
+        receivedBytes = 0
+        expectedBytes = -1
+        validRange = false
+        currentTask = task
+        task.resume()
+        return true
+    }
+
+    func releaseTicketIfNeverStarted() {
+        ticketLock.lock()
+        let held = wasStarted ? nil : ticket
+        if !wasStarted { ticket = nil }
+        ticketLock.unlock()
+        OriginRequestBudget.shared.release(held)
+    }
+
+    /// Completion and deinitialization may race; the ticket is returned at most once.
     func releaseTicket() {
         ticketLock.lock()
         let held = ticket
@@ -5826,8 +5939,20 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
         sourceTrace.redirect(task: task, response: response, request: request)
-        completionHandler(redirectPreservingHeaders(
-            task: task, newRequest: request, extraHeaders: extraHeaders))
+        let next = redirectPreservingHeaders(task: task, newRequest: request, extraHeaders: extraHeaders)
+        guard strict else { completionHandler(next); return }
+        ticketLock.lock()
+        redirectCount += 1
+        let length = response.expectedContentLength
+        let valid = redirectCount <= 5 && length >= 0 && length <= 4 * 1024 * 1024
+            && DispatchTime.now() < requestDeadline
+        pendingRedirect = valid ? next : nil
+        expectedBytes = length
+        receivedBytes = 0
+        validRange = valid
+        if !valid { OriginRequestBudget.shared.blockAdmission(for: originURL) }
+        ticketLock.unlock()
+        completionHandler(nil)
     }
 
     func urlSession(
@@ -5837,6 +5962,39 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
     ) {
         sourceTrace.response(task: dataTask, response: response)
+        if strict, let http = response as? HTTPURLResponse, (300..<400).contains(http.statusCode) {
+            ticketLock.lock()
+            let valid = pendingRedirect != nil && validRange && response.expectedContentLength == expectedBytes
+            ticketLock.unlock()
+            completionHandler(valid ? .allow : .cancel)
+            return
+        }
+        if strict {
+            let http = response as? HTTPURLResponse
+            let requestRange = dataTask.originalRequest?.value(forHTTPHeaderField: "Range") ?? ""
+            let parts = requestRange.dropFirst("bytes=".count).split(separator: "-", omittingEmptySubsequences: false)
+            let requestedStart = parts.count == 2 ? Int64(parts[0]) : nil
+            let requestedEnd = parts.count == 2 ? Int64(parts[1]) : nil
+            let span = http.flatMap { AVIOReader.contentRangeSpan($0) }
+            let contentRange = http?.value(forHTTPHeaderField: "Content-Range") ?? ""
+            let total = HTTPDiscIOReader.parseContentRangeTotal(contentRange)
+            var accepted = false
+            if requestRange.hasPrefix("bytes="), let requestedStart, let requestedEnd,
+               let span, let end = span.end, let total,
+               requestedStart >= 0, requestedEnd >= requestedStart, span.start == requestedStart,
+               end >= span.start, end <= requestedEnd, total > 0, end < total {
+                let (difference, overflow) = end.subtractingReportingOverflow(span.start)
+                let (length, lengthOverflow) = difference.addingReportingOverflow(1)
+                accepted = !overflow && !lengthOverflow && (end == requestedEnd || end == total - 1)
+                    && response.expectedContentLength == length
+            }
+            ticketLock.lock()
+            validRange = accepted
+            expectedBytes = response.expectedContentLength
+            if !validRange { OriginRequestBudget.shared.blockAdmission(for: originURL) }
+            ticketLock.unlock()
+            if !accepted { completionHandler(.cancel); return }
+        }
         guard let http = response as? HTTPURLResponse, let reader else {
             completionHandler(.cancel)
             return
@@ -5856,6 +6014,13 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         dataTask: URLSessionDataTask,
         didReceive data: Data
     ) {
+        if strict {
+            ticketLock.lock()
+            receivedBytes += Int64(data.count)
+            let redirectBody = pendingRedirect != nil
+            ticketLock.unlock()
+            if redirectBody { return }
+        }
         reader?.appendPersistentData(data, generation: generation)
     }
 
@@ -5865,7 +6030,28 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         didCompleteWithError error: Error?
     ) {
         sourceTrace.completed(task: task, error: error)
+        ticketLock.lock()
+        let complete = error == nil && validRange && receivedBytes == expectedBytes
+        let next = complete && transitionDeadline == nil && DispatchTime.now() < requestDeadline
+            ? pendingRedirect : nil
+        pendingRedirect = nil
+        if strict && !complete { OriginRequestBudget.shared.blockAdmission(for: originURL) }
+        if next == nil { transportDone = true }
+        ticketLock.unlock()
+        if let next {
+            let nextTask = session.dataTask(with: next)
+            nextTask.delegate = self
+            if reader?.continueStrictRedirect(from: task, to: nextTask, generation: generation) == true { return }
+            // The redirect task was never resumed. Detach before cancelling so its cleanup cannot
+            // deliver a second completion to this delegate, whose group belongs to the old task.
+            nextTask.delegate = nil
+            nextTask.cancel()
+            ticketLock.lock()
+            transportDone = true
+            ticketLock.unlock()
+        }
         releaseTicket()
+        completion.leave()
         reader?.persistentConnectionEnded(error: error, generation: generation)
     }
 

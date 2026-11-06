@@ -181,6 +181,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         /// nil = count only. Set by the host, or learned from a refusal.
         var limit: Int?
         var hostLimit: Int?
+        var admissionBlocked = false
         var refusals = 0
         var lastRefusalAt: DispatchTime?
         /// nil `quietUntil` means the request-rate pacer is inert. The bucket remains untouched
@@ -265,6 +266,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         var merged = origins[head] ?? OriginState()
         let joining = origins[targetHead]
         if let joining {
+            merged.admissionBlocked = merged.admissionBlocked || joining.admissionBlocked
             merged.inflight += joining.inflight
             merged.peakInflight = max(max(merged.peakInflight, joining.peakInflight), merged.inflight)
             merged.refusals += joining.refusals
@@ -470,6 +472,10 @@ final class OriginRequestBudget: @unchecked Sendable {
             lock.lock()
             let spentKey = headLocked(raw)
             var spent = origins[spentKey] ?? OriginState()
+            guard !spent.admissionBlocked, spent.hostLimit != 1 else {
+                lock.unlock()
+                return nil
+            }
             spent.inflight += 1
             spent.peakInflight = max(spent.peakInflight, spent.inflight)
             origins[spentKey] = spent
@@ -484,6 +490,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         lock.lock()
         let key = headLocked(raw)
         var state = origins[key] ?? OriginState()
+        guard !state.admissionBlocked else { lock.unlock(); return nil }
         if state.limit == nil || state.inflight < (state.limit ?? Int.max) {
             state.inflight += 1
             state.peakInflight = max(state.peakInflight, state.inflight)
@@ -533,7 +540,17 @@ final class OriginRequestBudget: @unchecked Sendable {
         }
 
         if signalled {
-            // `release` counted us in before signalling, so the slot is already ours.
+            lock.lock()
+            let keyNow = headLocked(raw)
+            var current = origins[keyNow] ?? OriginState()
+            if current.admissionBlocked {
+                let waitingIndex = current.waiters.firstIndex(where: { $0 === semaphore })
+                if let waitingIndex { current.waiters.remove(at: waitingIndex); origins[keyNow] = current }
+                lock.unlock()
+                if waitingIndex == nil { release(Ticket(key: raw, label: label, waitedMs: waitedMs, granted: true)) }
+                return nil
+            }
+            lock.unlock()
             return Ticket(key: raw, label: label, waitedMs: waitedMs, granted: true)
         }
 
@@ -544,15 +561,20 @@ final class OriginRequestBudget: @unchecked Sendable {
         // chain, and the bucket it queued on is then kept under the chain's key.
         let keyNow = headLocked(raw)
         var timedOut = origins[keyNow] ?? OriginState()
+        let canOvercommit = allowOvercommit && !timedOut.admissionBlocked && timedOut.hostLimit != 1
         if let i = timedOut.waiters.firstIndex(where: { $0 === semaphore }) {
             timedOut.waiters.remove(at: i)
-            if !allowOvercommit {
+            if !canOvercommit {
                 origins[keyNow] = timedOut
                 lock.unlock()
                 return nil
             }
             timedOut.inflight += 1   // proceeding anyway; stay honest about what is on the link
-        } else if !allowOvercommit {
+        } else if timedOut.admissionBlocked {
+            lock.unlock()
+            release(Ticket(key: raw, label: label, waitedMs: waitedMs, granted: true))
+            return nil
+        } else if !canOvercommit {
             // The release raced the deadline and already granted this caller a real slot.
             lock.unlock()
             return Ticket(key: raw, label: label, waitedMs: waitedMs, granted: true)
@@ -584,6 +606,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         var state = origins[key] ?? OriginState()
         let instant = now()
         disarmPacerIfQuietLocked(&state, at: instant)
+        guard !state.admissionBlocked else { return nil }
         guard state.inflight < (state.limit ?? Int.max) else {
             origins[key] = state
             return nil
@@ -617,7 +640,7 @@ final class OriginRequestBudget: @unchecked Sendable {
         // Hand the slot straight to the front of the queue rather than dropping the count and
         // letting whoever locks first take it: without that, a pump reconnecting at a range
         // boundary beats a detour that has been waiting since the last one.
-        if !state.waiters.isEmpty, state.inflight < (state.limit ?? Int.max) {
+        if !state.admissionBlocked, !state.waiters.isEmpty, state.inflight < (state.limit ?? Int.max) {
             let next = state.waiters.removeFirst()
             state.inflight += 1
             origins[key] = state
@@ -782,6 +805,24 @@ final class OriginRequestBudget: @unchecked Sendable {
                 + " that target, not our concurrency."
         }
         return note
+    }
+
+    func hasStrictHostLimit(for url: URL) -> Bool {
+        guard let raw = Self.originKey(for: url) else { return false }
+        lock.lock(); defer { lock.unlock() }
+        return origins[headLocked(raw)]?.hostLimit == 1
+    }
+
+    func blockAdmission(for url: URL) {
+        guard let raw = Self.originKey(for: url) else { return }
+        lock.lock()
+        let key = headLocked(raw)
+        var state = origins[key] ?? OriginState()
+        state.admissionBlocked = true
+        let waiters = state.waiters
+        origins[key] = state
+        lock.unlock()
+        for waiter in waiters { waiter.signal() }
     }
 
     /// Host-declared ceiling for this origin. Takes precedence over anything learned, in both
