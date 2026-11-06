@@ -6003,8 +6003,14 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
             ticketLock.unlock()
             if !accepted { completionHandler(.cancel); return }
         }
-        guard let http = response as? HTTPURLResponse, let reader else {
+        guard let http = response as? HTTPURLResponse else {
             completionHandler(.cancel)
+            return
+        }
+        guard let reader else {
+            // A validated strict range still owns the slot while its reader is torn down.
+            // Drain its body so the next reader can acquire the slot safely.
+            completionHandler(strict ? .allow : .cancel)
             return
         }
         // #377: unconditional, and the 2xx gate for pinning moved into the reader with the comment
