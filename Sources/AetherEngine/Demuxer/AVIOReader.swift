@@ -5456,6 +5456,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let ticket = try requestTicket(
             for: slotURL, label: "\(label) \(slotLabel)", timeout: slotWait)
         let lease = OriginRequestBudget.Lease(ticket)
+        let strict = OriginRequestBudget.shared.hasStrictHostLimit(for: slotURL)
 
         let delegate = ChunkFetchDelegate(extraHeaders: headers(for: request.url),
                                           bodyLimit: Self.expectedBodyBytes(for: request), diagnosticContext: diagnosticContext)
@@ -5467,8 +5468,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
 
         let semaphore = DispatchSemaphore(value: 0)
-        delegate.onCompletion = { [weak self] response in
+        delegate.onCompletion = { [weak self, weak delegate] response in
             self?.noteRateLimitedResponse(response)
+            if strict, let delegate, delegate.error != nil {
+                OriginRequestBudget.shared.blockAdmission(for: slotURL)
+            }
             lease.release()
             semaphore.signal()
         }
@@ -5484,6 +5488,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             shouldAbort: { [weak self] in self?.isClosed == true || self?.readDeadlinePassedOrAborted == true }
         )
         guard outcome == .signaled else {
+            if strict { OriginRequestBudget.shared.blockAdmission(for: slotURL) }
             task.cancel()
             finishCancelledProbeRequest(semaphore)
             throw AVIOReaderError.requestTimeout
