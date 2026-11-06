@@ -5860,7 +5860,9 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
 
     func drain(task: URLSessionDataTask) {
         ticketLock.lock()
-        if transitionDeadline == nil { transitionDeadline = .now() + 5 }
+        // A healthy range on a slow origin can need most of its own deadline to finish, so the
+        // transition waits for that deadline. Before markStarted it is still distantFuture.
+        if transitionDeadline == nil { transitionDeadline = min(requestDeadline, .now() + 35) }
         let deadline = min(transitionDeadline!, requestDeadline)
         ticketLock.unlock()
         if completion.wait(timeout: deadline) == .timedOut { expire(task: task) }
