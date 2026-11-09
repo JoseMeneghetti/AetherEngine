@@ -5819,7 +5819,7 @@ extension URLSessionDataTask: PersistentTransfer {
 }
 
 private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    private static let redirectBodyLimit: Int64 = 4 * 1024 * 1024
+    private static let controlBodyLimit: Int64 = 4 * 1024 * 1024
     private let sourceTrace: SourceNetworkDiagnostics.Trace
     weak var reader: AVIOReader?
     let generation: Int
@@ -5838,7 +5838,8 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
     private var transitionDeadline: DispatchTime?
     private var expectedBytes: Int64 = -1
     private var receivedBytes: Int64 = 0
-    private var validRange = false
+    private var validResponse = false
+    private var drainingRefusal = false
     private var pendingRedirect: URLRequest?
     private var redirectCount = 0
     private weak var currentTask: URLSessionDataTask?
@@ -5907,7 +5908,7 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         guard !expired, transitionDeadline == nil, DispatchTime.now() < requestDeadline else { return false }
         receivedBytes = 0
         expectedBytes = -1
-        validRange = false
+        validResponse = false
         currentTask = task
         task.resume()
         return true
@@ -5952,12 +5953,12 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         ticketLock.lock()
         redirectCount += 1
         let length = response.expectedContentLength
-        let valid = redirectCount <= 5 && length <= Self.redirectBodyLimit
+        let valid = redirectCount <= 5 && length <= Self.controlBodyLimit
             && DispatchTime.now() < requestDeadline
         pendingRedirect = valid ? next : nil
         expectedBytes = length
         receivedBytes = 0
-        validRange = valid
+        validResponse = valid
         if !valid { OriginRequestBudget.shared.blockAdmission(for: originURL) }
         ticketLock.unlock()
         completionHandler(nil)
@@ -5972,8 +5973,26 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         sourceTrace.response(task: dataTask, response: response)
         if strict, let http = response as? HTTPURLResponse, (300..<400).contains(http.statusCode) {
             ticketLock.lock()
-            let valid = pendingRedirect != nil && validRange && response.expectedContentLength == expectedBytes
+            let valid = pendingRedirect != nil && validResponse && response.expectedContentLength == expectedBytes
             ticketLock.unlock()
+            completionHandler(valid ? .allow : .cancel)
+            return
+        }
+        if strict, let http = response as? HTTPURLResponse, AVIOReader.isRateLimitStatus(http.statusCode) {
+            // Keep the slot until the refusal body finishes, but give the reader its status and
+            // Retry-After so the normal reconnect ladder can resume the media range.
+            ticketLock.lock()
+            expectedBytes = response.expectedContentLength
+            let valid = !expired && expectedBytes <= Self.controlBodyLimit
+            validResponse = valid
+            drainingRefusal = valid
+            if !valid { OriginRequestBudget.shared.blockAdmission(for: originURL) }
+            ticketLock.unlock()
+            if valid {
+                _ = reader?.persistentReceivedResponse(
+                    http, respondedBy: dataTask.currentRequest?.url ?? http.url, generation: generation
+                )
+            }
             completionHandler(valid ? .allow : .cancel)
             return
         }
@@ -5997,9 +6016,9 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
                     && response.expectedContentLength == length
             }
             ticketLock.lock()
-            validRange = accepted
+            validResponse = accepted
             expectedBytes = response.expectedContentLength
-            if !validRange { OriginRequestBudget.shared.blockAdmission(for: originURL) }
+            if !validResponse { OriginRequestBudget.shared.blockAdmission(for: originURL) }
             ticketLock.unlock()
             if !accepted { completionHandler(.cancel); return }
         }
@@ -6031,11 +6050,11 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
         if strict {
             ticketLock.lock()
             receivedBytes += Int64(data.count)
-            let redirectBody = pendingRedirect != nil
-            let redirectTooLarge = redirectBody && receivedBytes > Self.redirectBodyLimit
+            let controlBody = pendingRedirect != nil || drainingRefusal
+            let controlBodyTooLarge = controlBody && receivedBytes > Self.controlBodyLimit
             ticketLock.unlock()
-            if redirectTooLarge { expire(task: dataTask) }
-            if redirectBody { return }
+            if controlBodyTooLarge { expire(task: dataTask) }
+            if controlBody { return }
         }
         reader?.appendPersistentData(data, generation: generation)
     }
@@ -6047,12 +6066,12 @@ private final class PersistentReadDelegate: NSObject, URLSessionDataDelegate, @u
     ) {
         sourceTrace.completed(task: task, error: error)
         ticketLock.lock()
-        // A redirect without Content-Length can finish naturally at EOF or the end of a chunked
-        // body. Keep the ticket until that callback and bound the bytes even without a header.
-        let finishedUnknownRedirect = pendingRedirect != nil && expectedBytes < 0
-            && receivedBytes <= Self.redirectBodyLimit
-        let complete = error == nil && !expired && validRange
-            && (receivedBytes == expectedBytes || finishedUnknownRedirect)
+        // A redirect or refusal without Content-Length can finish naturally at EOF or the end of
+        // a chunked body. Keep the ticket until that callback and bound the bytes without a header.
+        let finishedUnknownControlBody = (pendingRedirect != nil || drainingRefusal) && expectedBytes < 0
+            && receivedBytes <= Self.controlBodyLimit
+        let complete = error == nil && !expired && validResponse
+            && (receivedBytes == expectedBytes || finishedUnknownControlBody)
         let next = complete && transitionDeadline == nil && DispatchTime.now() < requestDeadline
             ? pendingRedirect : nil
         pendingRedirect = nil
