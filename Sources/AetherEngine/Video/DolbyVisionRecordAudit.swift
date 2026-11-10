@@ -128,6 +128,13 @@ public enum DolbyVisionRecordAudit {
         return true
     }
 
+    /// Whether the recordless audit may open `url` a second time. Not on an origin the host limited to
+    /// one request: the second open is a second connection the provider counts, and a single-connection
+    /// IPTV account answered every later pump range with 509 until the session was torn down.
+    static func runsRecordlessAudit(for url: URL, budget: OriginRequestBudget = .shared) -> Bool {
+        !budget.hasStrictHostLimit(for: url)
+    }
+
     /// Run the recordless audit on a freshly probed video stream: when it is a candidate, read the first
     /// RPU from a second open of `url` and add the Profile 5 record if it says so. Called by the demuxer
     /// at the end of its own probe, so the load, the HLS producer's own open and every rebuild see the

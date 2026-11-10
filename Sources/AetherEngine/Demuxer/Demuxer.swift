@@ -1252,7 +1252,8 @@ public final class Demuxer: @unchecked Sendable {
             clipBase0Sec = Double(ctx.pointee.start_time) / Double(AV_TIME_BASE)
         }
         armGeneratedPTSSuppression(ctx)
-        if openProfile.auditsRecordlessDolbyVision, let source = auditSource {
+        if openProfile.auditsRecordlessDolbyVision, let source = auditSource,
+           DolbyVisionRecordAudit.runsRecordlessAudit(for: source.url) {
             let idx = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
             if idx >= 0, let codecpar = ctx.pointee.streams[Int(idx)]?.pointee.codecpar {
                 DolbyVisionRecordAudit.addRecordIfProfile5(
