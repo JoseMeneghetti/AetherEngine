@@ -4,7 +4,7 @@
     {
       "identity" : "ffmpegbuild",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/FFmpegBuild",
+      "location" : "https://github.com/JoseMeneghetti/FFmpegBuild",
       "state" : {
         "revision" : "9282e592b81d9aa1d699dcc70d46cf6b4d66b55f",
         "version" : "3.13.0"
@@ -13,7 +13,7 @@
     {
       "identity" : "libdovi",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/LibDovi",
+      "location" : "https://github.com/JoseMeneghetti/LibDovi",
       "state" : {
         "revision" : "0d7cce1d6836a30d13a3a2326e50a153af53f014",
         "version" : "2.1.0"
